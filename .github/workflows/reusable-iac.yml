@@ -1,0 +1,87 @@
+name: Reusable IaC
+
+# Called by service repos: uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/workflows/reusable-iac.yml@v1
+# One job: setup (tf-action) -> plan to a file -> apply THAT plan file (apply / destroy only).
+# Destroy is "plan -destroy" + apply, so the log always shows exactly what will be removed.
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: "plan | apply | destroy"
+        type: string
+        required: true
+      environment:
+        description: "dev | test | prod (used for the concurrency group)"
+        type: string
+        default: "dev"
+      working-directory:
+        description: "Terraform root config directory"
+        type: string
+        default: "iac/dev"
+      aws-region:
+        type: string
+        default: "us-west-2"
+      terraform-version:
+        type: string
+        default: "1.14.9"
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  iac:
+    runs-on: ubuntu-24.04
+    # Never run two Terraform jobs against the same env at once (queue, don't cancel a running apply).
+    # The S3 lockfile is the hard guarantee; this just avoids lock-timeout failures.
+    concurrency:
+      group: iac-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Validate action input
+        shell: bash
+        env:
+          ACTION: ${{ inputs.action }}
+        run: |
+          case "$ACTION" in
+            plan|apply|destroy) echo "action=$ACTION" ;;
+            *) echo "::error::action must be plan, apply or destroy (got '$ACTION')"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v5
+
+      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/tf-action@v1
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          terraform-version: ${{ inputs.terraform-version }}
+          aws-region: ${{ inputs.aws-region }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Plan
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ACTION: ${{ inputs.action }}
+          WORKDIR: ${{ inputs.working-directory }}
+        run: |
+          DESTROY_FLAG=""
+          [ "$ACTION" = "destroy" ] && DESTROY_FLAG="-destroy"
+          terraform plan -input=false -no-color -lock-timeout=5m $DESTROY_FLAG -out=tfplan
+          {
+            echo "### Terraform ${ACTION} — \`${WORKDIR}\`"
+            echo '```'
+            terraform show -no-color tfplan | tail -n 60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Applies exactly the plan above (no re-plan); for destroy that plan is a destroy plan
+      - name: Apply plan
+        if: inputs.action == 'apply' || inputs.action == 'destroy'
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+        run: terraform apply -input=false -no-color -lock-timeout=5m tfplan
