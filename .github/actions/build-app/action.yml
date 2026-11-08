@@ -1,0 +1,38 @@
+name: "Build App (Node)"
+description: "Set up Node, install deps with npm ci, run one npm script (lint / test / test:coverage)"
+
+inputs:
+  node-version:
+    description: "Node.js version"
+    required: false
+    default: "24"
+  working-directory:
+    description: "Directory containing package.json"
+    required: false
+    default: "."
+  script:
+    description: "npm script to run after install (e.g. lint, test, test:coverage)"
+    required: false
+    default: "test"
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+    - name: Install (lockfile-exact)
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: npm ci
+
+    # Input goes through env, not ${{ }} inside run:, so it is never parsed as shell code (script injection)
+    - name: Run npm script
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SCRIPT: ${{ inputs.script }}
+      run: npm run "$SCRIPT"
