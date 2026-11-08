@@ -3,6 +3,11 @@ name: Reusable App CI
 # Called by service repos: uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/workflows/reusable-app-ci.yml@v1
 # Job names (lint, test, audit, build-image) are the check names the service rulesets require
 # (shown as "<caller-job> / <job>").
+#
+# Path routing is done HERE at job level (the `changes` job), not with paths-ignore in the caller.
+# A workflow skipped by a path filter creates no checks, so required checks stay "Expected" and an
+# IaC-only PR is blocked forever. A job skipped by `if:` still reports a "skipped" check, which
+# rulesets count as passing.
 on:
   workflow_call:
     inputs:
@@ -32,6 +37,10 @@ on:
         description: "SonarCloud scan (needs sonar-project.properties + SONAR_TOKEN)"
         type: boolean
         default: true
+      ignore-paths-regex:
+        description: "Extended regex; if EVERY changed file matches, app jobs are skipped"
+        type: string
+        default: '^iac/|(^|/)Jenkinsfile$'
     secrets:
       REGISTRY_USERNAME:
         required: false
@@ -47,26 +56,67 @@ permissions:
 # Inside a reusable workflow, "./" resolves against the CALLER's checkout (the service repo),
 # where these actions do not exist. Keep the @v1 below in step with the platform tag.
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      app: ${{ steps.diff.outputs.app }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # need the base commit to diff against
+      - id: diff
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          IGNORE: ${{ inputs.ignore-paths-regex }}
+        run: |
+          case "$EVENT" in
+            pull_request) BASE="$PR_BASE" ;;
+            push)         BASE="$PUSH_BEFORE" ;;
+            *)            BASE="" ;;
+          esac
+          # Fail safe: no usable base (new branch, manual run, missing commit) -> run everything
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "No usable base for '$EVENT', running all app jobs"
+            echo "app=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BASE" "$GITHUB_SHA")
+          printf 'Changed files:\n%s\n' "$CHANGED"
+          # Files that are NOT ignored = app-relevant. (No `grep -qv`: its exit code differs across grep builds)
+          APP_FILES=$(printf '%s\n' "$CHANGED" | grep -vE "$IGNORE" || true)
+          printf 'App-relevant files:\n%s\n' "${APP_FILES:-<none>}"
+          # Empty diff -> fail safe (run everything); otherwise run only if something app-relevant changed
+          if [ -z "$CHANGED" ] || [ -n "$APP_FILES" ]; then APP=true; else APP=false; fi
+          echo "app=$APP" | tee -a "$GITHUB_OUTPUT"
+
+  lint:
+    needs: [changes]
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
       - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v1
         with:
           node-version: ${{ inputs.node-version }}
           script: lint
 
   test:
-    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v1
         with:
           node-version: ${{ inputs.node-version }}
           script: ${{ inputs.test-script }}
       # Handed to the sonar job; only needed within this run
       - if: inputs.run-sonar
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage
           path: coverage/lcov.info
@@ -74,10 +124,12 @@ jobs:
           retention-days: 1
 
   audit:
-    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ inputs.node-version }}
       # Reads package-lock.json only; no npm ci needed
@@ -85,16 +137,20 @@ jobs:
         env:
           AUDIT_LEVEL: ${{ inputs.audit-level }}
 
-  # The quality gate itself is enforced by the SonarCloud app's check in the service ruleset
+  # Runs on EVERY change (not gated by `changes`): the SonarCloud app posts the required
+  # "SonarCloud Code Analysis" check only when a scan runs. On an IaC-only PR there is no new code
+  # in sonar.sources, so the gate passes without coverage.
+  # The quality gate itself is enforced by that app check in the service ruleset.
   sonar:
-    if: inputs.run-sonar
-    needs: [test]
-    runs-on: ubuntu-latest
+    needs: [changes, test]
+    if: ${{ !cancelled() && inputs.run-sonar && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # blame + merge base: Sonar needs full history to tell new code from old
-      - uses: actions/download-artifact@v4
+      - if: needs.test.result == 'success'
+        uses: actions/download-artifact@v7
         with:
           name: coverage
           path: coverage/
@@ -104,10 +160,11 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
   build-image:
-    needs: [lint, test, audit]
-    runs-on: ubuntu-latest
+    needs: [changes, lint, test, audit]
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/docker-build-push@v1
         with:
           image-name: ${{ inputs.image-name }}

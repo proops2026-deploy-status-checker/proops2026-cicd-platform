@@ -18,7 +18,7 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - uses: actions/setup-node@v4
+    - uses: actions/setup-node@v5 # lowest major on the Node 24 runtime
       with:
         node-version: ${{ inputs.node-version }}
         cache: npm
