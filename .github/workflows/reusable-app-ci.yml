@@ -1,0 +1,117 @@
+name: Reusable App CI
+
+# Called by service repos: uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/workflows/reusable-app-ci.yml@v1
+# Job names (lint, test, audit, build-image) are the check names the service rulesets require
+# (shown as "<caller-job> / <job>").
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "24"
+      image-name:
+        description: "Image repository without tag, e.g. tert62/dsc-api-gateway"
+        type: string
+        required: true
+      image-tag:
+        description: "Full commit SHA"
+        type: string
+        required: true
+      push-image:
+        description: "false on PRs (build only), true on merge to the default branch"
+        type: boolean
+        default: false
+      test-script:
+        description: "npm script for tests; use one that writes coverage/lcov.info when run-sonar is true"
+        type: string
+        default: "test"
+      audit-level:
+        type: string
+        default: "critical"
+      run-sonar:
+        description: "SonarCloud scan (needs sonar-project.properties + SONAR_TOKEN)"
+        type: boolean
+        default: true
+    secrets:
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_TOKEN:
+        required: false
+      SONAR_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+# Composite actions are referenced by absolute path + tag, NOT ./.github/actions/...
+# Inside a reusable workflow, "./" resolves against the CALLER's checkout (the service repo),
+# where these actions do not exist. Keep the @v1 below in step with the platform tag.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v1
+        with:
+          node-version: ${{ inputs.node-version }}
+          script: lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v1
+        with:
+          node-version: ${{ inputs.node-version }}
+          script: ${{ inputs.test-script }}
+      # Handed to the sonar job; only needed within this run
+      - if: inputs.run-sonar
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 1
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      # Reads package-lock.json only; no npm ci needed
+      - run: npm audit --audit-level="$AUDIT_LEVEL"
+        env:
+          AUDIT_LEVEL: ${{ inputs.audit-level }}
+
+  # The quality gate itself is enforced by the SonarCloud app's check in the service ruleset
+  sonar:
+    if: inputs.run-sonar
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # blame + merge base: Sonar needs full history to tell new code from old
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+      # Third-party action pinned by commit SHA (v8.3.0)
+      - uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build-image:
+    needs: [lint, test, audit]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/docker-build-push@v1
+        with:
+          image-name: ${{ inputs.image-name }}
+          image-tag: ${{ inputs.image-tag }}
+          push: ${{ inputs.push-image }}
+          registry-username: ${{ secrets.REGISTRY_USERNAME }}
+          registry-password: ${{ secrets.REGISTRY_TOKEN }}
