@@ -30,6 +30,10 @@ on:
         description: "npm script for tests; use one that writes coverage/lcov.info when run-sonar is true"
         type: string
         default: "test"
+      prepare-script:
+        description: "Optional npm script run after npm ci in lint + test (e.g. prisma:generate)"
+        type: string
+        default: ""
       audit-level:
         type: string
         default: "critical"
@@ -103,6 +107,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           script: lint
+          prepare-script: ${{ inputs.prepare-script }}
 
   test:
     needs: [changes]
@@ -114,6 +119,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           script: ${{ inputs.test-script }}
+          prepare-script: ${{ inputs.prepare-script }}
       # Handed to the sonar job; only needed within this run
       - if: inputs.run-sonar
         uses: actions/upload-artifact@v6

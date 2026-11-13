@@ -14,6 +14,10 @@ inputs:
     description: "npm script to run after install (e.g. lint, test, test:coverage)"
     required: false
     default: "test"
+  prepare-script:
+    description: "Optional npm script run after install, before `script` (e.g. prisma:generate). Empty = skip"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -28,6 +32,15 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: npm ci
+
+    # Code generation that lint/build/test depend on (Prisma client for deploy-service / log-service)
+    - name: Run prepare script
+      if: inputs.prepare-script != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PREPARE: ${{ inputs.prepare-script }}
+      run: npm run "$PREPARE"
 
     # Input goes through env, not ${{ }} inside run:, so it is never parsed as shell code (script injection)
     - name: Run npm script
