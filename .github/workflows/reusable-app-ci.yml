@@ -31,7 +31,15 @@ on:
         type: string
         default: "test"
       prepare-script:
-        description: "Optional npm script run after npm ci in lint + test (e.g. prisma:generate)"
+        description: "Optional npm script(s), space-separated, run after npm ci in lint + test (e.g. prisma:generate)"
+        type: string
+        default: ""
+      postgres-image:
+        description: "Start a throwaway PostgreSQL service for the test job (e.g. postgres:16). Empty = no database"
+        type: string
+        default: ""
+      migrate-script:
+        description: "npm script that migrates the test database (e.g. prisma:migrate); runs in test only, when postgres-image is set"
         type: string
         default: ""
       audit-level:
@@ -113,13 +121,34 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-24.04
+    # Throwaway database for integration tests. An empty image means the service is not started,
+    # so callers without postgres-image (api-gateway) run exactly as before.
+    # Credentials are fixed and local to this runner: the container dies with the job.
+    services:
+      postgres:
+        image: ${{ inputs.postgres-image }}
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ci -d test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Tests skip their PostgreSQL suites when TEST_DATABASE_URL is empty; Prisma migrate reads DATABASE_URL
+      TEST_DATABASE_URL: ${{ inputs.postgres-image != '' && 'postgresql://ci:ci@localhost:5432/test' || '' }}
+      DATABASE_URL: ${{ inputs.postgres-image != '' && 'postgresql://ci:ci@localhost:5432/test' || '' }}
     steps:
       - uses: actions/checkout@v5
       - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v1
         with:
           node-version: ${{ inputs.node-version }}
           script: ${{ inputs.test-script }}
-          prepare-script: ${{ inputs.prepare-script }}
+          # prepare (e.g. prisma:generate), then migrate the throwaway DB when there is one
+          prepare-script: ${{ format('{0} {1}', inputs.prepare-script, inputs.postgres-image != '' && inputs.migrate-script || '') }}
       # Handed to the sonar job; only needed within this run
       - if: inputs.run-sonar
         uses: actions/upload-artifact@v6

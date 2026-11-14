@@ -15,7 +15,7 @@ inputs:
     required: false
     default: "test"
   prepare-script:
-    description: "Optional npm script run after install, before `script` (e.g. prisma:generate). Empty = skip"
+    description: "Optional npm script(s), space-separated, run in order after install, before `script` (e.g. 'prisma:generate prisma:migrate'). Empty = skip"
     required: false
     default: ""
 
@@ -34,13 +34,19 @@ runs:
       run: npm ci
 
     # Code generation that lint/build/test depend on (Prisma client for deploy-service / log-service)
-    - name: Run prepare script
+    - name: Run prepare script(s)
       if: inputs.prepare-script != ''
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         PREPARE: ${{ inputs.prepare-script }}
-      run: npm run "$PREPARE"
+      # Word-splitting on spaces is intended (npm script names contain no spaces); each runs in order, set -e stops on failure
+      run: |
+        for s in $PREPARE; do
+          echo "::group::npm run $s"
+          npm run "$s"
+          echo "::endgroup::"
+        done
 
     # Input goes through env, not ${{ }} inside run:, so it is never parsed as shell code (script injection)
     - name: Run npm script
