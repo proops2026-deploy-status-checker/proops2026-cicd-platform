@@ -1,6 +1,8 @@
-name: Reusable App CI
+name: Reusable Build
 
-# Called by service repos: uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/workflows/reusable-app-ci.yml@v1
+# Called by service repos: uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/workflows/reusable-build.yml@v2
+# v2: renamed from reusable-app-ci.yml (v1) and now RETURNS the pushed image (outputs.image-tag /
+# image-digest) so the caller can hand it to reusable-deploy.yml. Build once here; deploy never builds.
 # Job names (lint, test, audit, build-image) are the check names the service rulesets require
 # (shown as "<caller-job> / <job>").
 #
@@ -53,6 +55,15 @@ on:
         description: "Extended regex; if EVERY changed file matches, app jobs are skipped"
         type: string
         default: '^iac/|(^|/)Jenkinsfile$'
+    outputs:
+      # Workflow-level outputs are the only way a reusable workflow returns values to its caller.
+      # They bridge from the job-level outputs of build-image below. Caller reads needs.<job>.outputs.image-tag
+      image-tag:
+        description: "Pushed image tag (full commit SHA). Empty when nothing was pushed (PR build, or app jobs skipped by path routing)"
+        value: ${{ jobs.build-image.outputs.image-tag }}
+      image-digest:
+        description: "Registry digest (sha256:...) of the pushed image: the identity of the bytes every env must run"
+        value: ${{ jobs.build-image.outputs.image-digest }}
     secrets:
       REGISTRY_USERNAME:
         required: false
@@ -66,7 +77,7 @@ permissions:
 
 # Composite actions are referenced by absolute path + tag, NOT ./.github/actions/...
 # Inside a reusable workflow, "./" resolves against the CALLER's checkout (the service repo),
-# where these actions do not exist. Keep the @v1 below in step with the platform tag.
+# where these actions do not exist. Keep the @v2 below in step with the platform tag.
 jobs:
   changes:
     runs-on: ubuntu-24.04
@@ -111,7 +122,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v1
+      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v2
         with:
           node-version: ${{ inputs.node-version }}
           script: lint
@@ -143,7 +154,7 @@ jobs:
       DATABASE_URL: ${{ inputs.postgres-image != '' && 'postgresql://ci:ci@localhost:5432/test' || '' }}
     steps:
       - uses: actions/checkout@v5
-      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v1
+      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/build-app@v2
         with:
           node-version: ${{ inputs.node-version }}
           script: ${{ inputs.test-script }}
@@ -198,12 +209,40 @@ jobs:
     needs: [changes, lint, test, audit]
     if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-24.04
+    outputs:
+      image-tag: ${{ steps.result.outputs.image-tag }}
+      image-digest: ${{ steps.result.outputs.image-digest }}
     steps:
       - uses: actions/checkout@v5
-      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/docker-build-push@v1
+      - id: image
+        uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/docker-build-push@v2
         with:
           image-name: ${{ inputs.image-name }}
           image-tag: ${{ inputs.image-tag }}
           push: ${{ inputs.push-image }}
           registry-username: ${{ secrets.REGISTRY_USERNAME }}
           registry-password: ${{ secrets.REGISTRY_TOKEN }}
+      # Only a PUSHED image is promotable: on PRs the outputs stay empty so nothing can deploy it.
+      - id: result
+        if: inputs.push-image
+        shell: bash
+        env:
+          IMAGE: docker.io/${{ inputs.image-name }}
+          TAG: ${{ inputs.image-tag }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          if [[ ! "$TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::image-tag must be the full 40-char commit SHA to be promotable, got '$TAG'"
+            exit 1
+          fi
+          echo "image-tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image-digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Image pushed: promote this SHA to staging / prod"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`$IMAGE:$TAG\` |"
+            echo "| image-tag (paste into Deploy Staging / Production) | \`$TAG\` |"
+            echo "| Digest | \`$DIGEST\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

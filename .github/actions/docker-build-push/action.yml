@@ -27,6 +27,11 @@ inputs:
     description: "Registry access token"
     required: false
 
+outputs:
+  digest:
+    description: "Image digest (sha256:...) reported by the registry push; empty on build-only"
+    value: ${{ steps.build.outputs.digest }}
+
 runs:
   using: "composite"
   steps:
@@ -41,6 +46,7 @@ runs:
         password: ${{ inputs.registry-password }}
 
     - name: Build (and push if enabled)
+      id: build
       uses: docker/build-push-action@v7
       with:
         context: ${{ inputs.context }}
