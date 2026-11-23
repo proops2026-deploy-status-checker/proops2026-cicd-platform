@@ -1,0 +1,203 @@
+name: Reusable Deploy
+
+# Called by service repos: uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/workflows/reusable-deploy.yml@v2
+#
+# PROMOTES an image that reusable-build.yml already pushed. It never builds: the same
+# <image-name>:<full-sha> goes to dev, then staging, then prod (build once, promote many).
+#
+# Secrets: callers pass `secrets: inherit`. The job below declares `environment:`, so GitHub resolves
+# THAT environment's secrets here (KUBE_CONFIG_DATA + app secrets: same names, different values per env).
+# Passing `KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}` from the caller does not work: the caller
+# job has no environment, so it can only see the repo-level value (none).
+#
+# Environment name = K8s namespace (dev | staging | prod).
+# Manifests come from the caller's checkout (default branch); only the image is pinned to the SHA.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "dev | staging | prod: GitHub Environment (secrets) AND K8s namespace"
+        type: string
+        required: true
+      image-name:
+        description: "Image repository without registry or tag, e.g. tert62/dsc-api-gateway"
+        type: string
+        required: true
+      image-tag:
+        description: "Full 40-char commit SHA of an image reusable-build.yml pushed"
+        type: string
+        required: true
+      service-name:
+        description: "Deployment AND container name; Pods carry label app=<service-name>"
+        type: string
+        required: true
+      manifest-dir:
+        description: "Directory with the K8s manifests (no hardcoded metadata.namespace)"
+        type: string
+        default: "k8s"
+      app-secret-keys:
+        description: "Space-separated environment secret names copied into K8s Secret <service-name>-secret. Empty = none"
+        type: string
+        default: ""
+      registry:
+        type: string
+        default: "docker.io"
+      runs-on:
+        description: "JSON runner labels. Default = the self-hosted runner next to minikube"
+        type: string
+        default: '["self-hosted", "minikube-deploy"]'
+      rollout-timeout:
+        type: string
+        default: "180s"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy (${{ inputs.environment }})
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    environment: ${{ inputs.environment }} # <- resolves env-specific secrets
+    # One deploy per service+env at a time; queue instead of cancelling a half-done rollout
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    # Inputs reach shell only through env (never ${{ }} inside run:) -> no script injection
+    env:
+      NS: ${{ inputs.environment }}
+      SERVICE: ${{ inputs.service-name }}
+      TAG: ${{ inputs.image-tag }}
+      IMAGE: ${{ inputs.registry }}/${{ inputs.image-name }}:${{ inputs.image-tag }}
+      MANIFESTS: ${{ inputs.manifest-dir }}
+      ROLLOUT_TIMEOUT: ${{ inputs.rollout-timeout }}
+    steps:
+      - name: Validate inputs
+        run: |
+          case "$NS" in dev|staging|prod) ;; *)
+            echo "::error::environment must be dev, staging or prod, got '$NS'"; exit 1 ;;
+          esac
+          if [[ ! "$TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::image-tag must be a full 40-char commit SHA (copy it from the build run summary), got '$TAG'"
+            exit 1
+          fi
+
+      # Fail before touching the cluster if the SHA was never built/pushed (typo, PR-only SHA, deleted tag)
+      - name: Check image exists in registry
+        id: registry
+        run: |
+          if ! OUT=$(docker buildx imagetools inspect "$IMAGE" 2>&1); then
+            echo "::error::$IMAGE not found in the registry. Was it built by a merge to the default branch?"
+            echo "$OUT"; exit 1
+          fi
+          DIGEST=$(awk '/^Digest:/ {print $2; exit}' <<<"$OUT")
+          echo "Registry digest: $DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+
+      # The self-hosted runner uses the host's kubectl; hosted runners need it installed
+      - if: runner.environment == 'github-hosted'
+        uses: azure/setup-kubectl@v4
+
+      # Own file under RUNNER_TEMP, NOT ~/.kube/config: on a self-hosted runner that is the
+      # engineer's real kubeconfig and would be overwritten.
+      - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
+        run: |
+          if [ -z "$KUBE_CONFIG_DATA" ]; then
+            echo "::error::KUBE_CONFIG_DATA is empty: set it in environment '$NS' and call with 'secrets: inherit'"
+            exit 1
+          fi
+          KCFG="$RUNNER_TEMP/kubeconfig-$GITHUB_RUN_ID-$NS"
+          (umask 077; printf '%s' "$KUBE_CONFIG_DATA" | base64 --decode > "$KCFG")
+          echo "KUBECONFIG=$KCFG" >> "$GITHUB_ENV"
+          KUBECONFIG="$KCFG" kubectl cluster-info | head -1
+
+      - name: Ensure namespace
+        run: |
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace "$NS" env="$NS" --overwrite
+
+      # GitHub environment secrets live only on the runner; the Pod reads a K8s Secret.
+      # Values go through files (not --from-literal) so they never appear in a process list.
+      - name: Sync app secrets -> Secret/${{ inputs.service-name }}-secret
+        if: inputs.app-secret-keys != ''
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          KEYS: ${{ inputs.app-secret-keys }}
+        run: |
+          DIR=$(mktemp -d "$RUNNER_TEMP/secret.XXXXXX"); trap 'rm -rf "$DIR"' EXIT
+          for k in $KEYS; do
+            v=$(jq -r --arg k "$k" '.[$k] // empty' <<<"$SECRETS_JSON")
+            if [ -z "$v" ]; then echo "::error::secret '$k' is not set in environment '$NS'"; exit 1; fi
+            (umask 077; printf '%s' "$v" > "$DIR/$k")
+          done
+          kubectl -n "$NS" create secret generic "$SERVICE-secret" --from-file="$DIR" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Deployment: image pinned to the SHA + change-cause annotation BEFORE apply, so the new
+      # ReplicaSet records it (kubectl rollout history shows which SHA each revision ran).
+      - name: Apply manifests (image @${{ inputs.image-tag }})
+        run: |
+          shopt -s nullglob
+          FILES=("$MANIFESTS"/*.yaml "$MANIFESTS"/*.yml)
+          [ ${#FILES[@]} -gt 0 ] || { echo "::error::no manifests in $MANIFESTS"; exit 1; }
+          FOUND=false
+          for f in "${FILES[@]}"; do
+            if grep -q '^kind: Deployment' "$f"; then
+              FOUND=true
+              kubectl set image --local -f "$f" "$SERVICE=$IMAGE" -o yaml \
+                | kubectl annotate --local -f - -o yaml --overwrite \
+                    "kubernetes.io/change-cause=$TAG by $GITHUB_ACTOR ($GITHUB_WORKFLOW #$GITHUB_RUN_NUMBER)" \
+                | kubectl -n "$NS" apply -f -
+            else
+              kubectl -n "$NS" apply -f "$f"
+            fi
+          done
+          $FOUND || { echo "::error::no Deployment manifest in $MANIFESTS"; exit 1; }
+
+      - name: Wait for rollout
+        run: kubectl -n "$NS" rollout status "deployment/$SERVICE" --timeout="$ROLLOUT_TIMEOUT"
+
+      - name: Diagnostics on failure
+        if: failure() && env.KUBECONFIG != ''
+        run: |
+          kubectl -n "$NS" get deploy,rs,pods -l "app=$SERVICE" -o wide || true
+          kubectl -n "$NS" describe pods -l "app=$SERVICE" | tail -40 || true
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -20 || true
+
+      # Proof of promotion: what the cluster runs must equal what was asked for, tag AND bytes
+      - name: Verify running image
+        env:
+          REGISTRY_DIGEST: ${{ steps.registry.outputs.digest }}
+        run: |
+          kubectl -n "$NS" describe pods -l "app=$SERVICE" | grep -E "^\s+(Image|Image ID):|^Status:"
+          WANT=$(kubectl -n "$NS" get "deployment/$SERVICE" \
+            -o jsonpath="{.spec.template.spec.containers[?(@.name=='$SERVICE')].image}")
+          [ "$WANT" = "$IMAGE" ] || { echo "::error::deployment image is $WANT, expected $IMAGE"; exit 1; }
+          RUNNING=$(kubectl -n "$NS" get pods -l "app=$SERVICE" --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}' | grep -oE 'sha256:[0-9a-f]{64}' | sort -u)
+          if [ "$RUNNING" = "$REGISTRY_DIGEST" ]; then
+            RESULT="match"
+          else
+            RESULT="differs (pod: ${RUNNING:-none}). Compare manually"
+            echo "::warning::pod digest ${RUNNING:-none} != registry digest $REGISTRY_DIGEST"
+          fi
+          {
+            echo "### Deployed to \`$NS\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| Registry digest | \`$REGISTRY_DIGEST\` |"
+            echo "| Pod digest vs registry | $RESULT |"
+            echo "| Triggered by | $GITHUB_ACTOR via $GITHUB_WORKFLOW #$GITHUB_RUN_NUMBER |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove kubeconfig
+        if: always()
+        run: rm -f "${KUBECONFIG:-/nonexistent}"

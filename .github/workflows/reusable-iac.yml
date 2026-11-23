@@ -1,6 +1,6 @@
 name: Reusable IaC
 
-# Called by service repos: uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/workflows/reusable-iac.yml@v1
+# Called by service repos: uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/workflows/reusable-iac.yml@v2
 # One job: setup (tf-action) -> plan to a file -> apply THAT plan file (apply / destroy only).
 # Destroy is "plan -destroy" + apply, so the log always shows exactly what will be removed.
 on:
@@ -54,7 +54,7 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/tf-action@v1
+      - uses: proops2026-deploy-status-checker/proops2026-cicd-platform/.github/actions/tf-action@v2
         with:
           working-directory: ${{ inputs.working-directory }}
           terraform-version: ${{ inputs.terraform-version }}
