@@ -20,6 +20,10 @@ inputs:
     description: "'true' = login + push, 'false' = build only (proves the Dockerfile)"
     required: false
     default: "false"
+  platforms:
+    description: "Comma-separated target platforms, e.g. linux/amd64,linux/arm64 (multi-arch = one tag, one index digest, runs on Intel and ARM nodes)"
+    required: false
+    default: "linux/amd64"
   registry-username:
     description: "Registry username (composite actions cannot read secrets; the caller passes it in)"
     required: false
@@ -35,6 +39,10 @@ outputs:
 runs:
   using: "composite"
   steps:
+    # QEMU only when a non-amd64 platform is requested (the hosted runner is amd64)
+    - if: inputs.platforms != 'linux/amd64'
+      uses: docker/setup-qemu-action@v4
+
     - uses: docker/setup-buildx-action@v4
 
     - name: Login to registry
@@ -50,6 +58,7 @@ runs:
       uses: docker/build-push-action@v7
       with:
         context: ${{ inputs.context }}
+        platforms: ${{ inputs.platforms }}
         push: ${{ inputs.push == 'true' }}
         tags: ${{ inputs.registry }}/${{ inputs.image-name }}:${{ inputs.image-tag }}
         cache-from: type=gha
