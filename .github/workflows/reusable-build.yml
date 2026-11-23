@@ -24,6 +24,10 @@ on:
         description: "Full commit SHA"
         type: string
         required: true
+      platforms:
+        description: "Image platforms. Add linux/arm64 when any target cluster runs ARM (Apple Silicon minikube, Graviton)"
+        type: string
+        default: "linux/amd64"
       push-image:
         description: "false on PRs (build only), true on merge to the default branch"
         type: boolean
@@ -220,6 +224,7 @@ jobs:
           image-name: ${{ inputs.image-name }}
           image-tag: ${{ inputs.image-tag }}
           push: ${{ inputs.push-image }}
+          platforms: ${{ inputs.platforms }}
           registry-username: ${{ secrets.REGISTRY_USERNAME }}
           registry-password: ${{ secrets.REGISTRY_TOKEN }}
       # Only a PUSHED image is promotable: on PRs the outputs stay empty so nothing can deploy it.
